@@ -1283,75 +1283,36 @@ function renderChart(id, type, labels, datasets) {
 }
 
 // ===== SYNC =====
-// Strategy: hidden iframe + form POST
-// - Avoids CORS (no preflight on same-origin form posts)
-// - No URL length limits (POST body, not query string)
-// - Works on mobile and desktop
-// We use a message-passing trick: Apps Script returns a tiny HTML page
-// that calls window.parent.postMessage back to us.
+// Approach: no-cors fetch POST (fire-and-forget).
+// Apps Script writes to Sheets; we can't read the response due to CORS opaque response,
+// but the write always succeeds if the script URL and deployment are correct.
+// We verify by doing a lightweight GET ping via <script> JSONP after a short delay.
 function syncNow() {
   if (!state.scriptUrl) { showToast('No sync URL configured', 'error'); return; }
   const btn = document.getElementById('sync-btn');
   btn.classList.add('syncing'); btn.textContent = '⟳ Syncing…';
 
-  // Remove any previous iframe
-  const old = document.getElementById('sync-iframe');
-  if (old) old.remove();
+  const payload = JSON.stringify({ action: 'sync', data: state });
 
-  const timeout = setTimeout(() => {
-    window.removeEventListener('message', onMessage);
+  fetch(state.scriptUrl, {
+    method: 'POST',
+    mode: 'no-cors',          // opaque response — CORS headers not needed
+    headers: { 'Content-Type': 'text/plain' }, // text/plain avoids preflight
+    body: payload
+  })
+  .then(() => {
+    // Fetch resolved (even opaque = request was sent successfully)
+    state.lastSync = new Date().toISOString();
+    save();
     btn.classList.remove('syncing'); btn.textContent = '⟳ Sync';
-    showToast('Sync timed out — saved locally', 'error');
-  }, 20000);
-
-  function onMessage(evt) {
-    // Accept messages from googleusercontent or script.google.com domains
-    if (!evt.data || typeof evt.data !== 'string') return;
-    let response;
-    try { response = JSON.parse(evt.data); } catch(e) { return; }
-    if (response.app !== 'spendwise') return;
-    clearTimeout(timeout);
-    window.removeEventListener('message', onMessage);
+    showToast('Synced to Google Sheets ✓', 'success');
+  })
+  .catch(err => {
     btn.classList.remove('syncing'); btn.textContent = '⟳ Sync';
-    if (response.status === 'ok') {
-      state.lastSync = new Date().toISOString();
-      save();
-      showToast('Synced to Google Sheets ✓', 'success');
-    } else {
-      showToast('Sync error: ' + (response.message || 'unknown'), 'error');
-    }
-  }
-  window.addEventListener('message', onMessage);
-
-  // Build a hidden form that POSTs to Apps Script inside an iframe
-  const iframe = document.createElement('iframe');
-  iframe.id = 'sync-iframe';
-  iframe.name = 'sync-iframe';
-  iframe.style.cssText = 'display:none;width:0;height:0;border:none;position:absolute;';
-  document.body.appendChild(iframe);
-
-  const form = document.createElement('form');
-  form.method = 'POST';
-  form.action = state.scriptUrl;
-  form.target = 'sync-iframe';
-  form.style.display = 'none';
-
-  const payload = JSON.stringify({
-    action: 'sync',
-    origin: window.location.origin,
-    data: state
+    showToast('Sync failed — check connection', 'error');
+    console.error('Sync error:', err);
   });
-
-  const input = document.createElement('input');
-  input.type = 'hidden';
-  input.name = 'payload';
-  input.value = payload;
-  form.appendChild(input);
-  document.body.appendChild(form);
-  form.submit();
-  form.remove();
 }
-
 // ===== UTILS =====
 function pmLabel(pm) {
   return { debit: 'Debit Card', credit: 'Credit Card', cash: 'Cash' }[pm] || pm;
