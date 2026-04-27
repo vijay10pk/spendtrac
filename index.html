@@ -1283,55 +1283,73 @@ function renderChart(id, type, labels, datasets) {
 }
 
 // ===== SYNC =====
-// Apps Script redirects during execution which browsers block even on plain GET.
-// JSONP (injecting a <script> tag) is the only reliable way to call it from a browser.
+// Strategy: hidden iframe + form POST
+// - Avoids CORS (no preflight on same-origin form posts)
+// - No URL length limits (POST body, not query string)
+// - Works on mobile and desktop
+// We use a message-passing trick: Apps Script returns a tiny HTML page
+// that calls window.parent.postMessage back to us.
 function syncNow() {
   if (!state.scriptUrl) { showToast('No sync URL configured', 'error'); return; }
   const btn = document.getElementById('sync-btn');
   btn.classList.add('syncing'); btn.textContent = '⟳ Syncing…';
 
-  const cbName = 'spendwiseCb_' + Date.now();
+  // Remove any previous iframe
+  const old = document.getElementById('sync-iframe');
+  if (old) old.remove();
 
   const timeout = setTimeout(() => {
-    cleanup();
+    window.removeEventListener('message', onMessage);
     btn.classList.remove('syncing'); btn.textContent = '⟳ Sync';
     showToast('Sync timed out — saved locally', 'error');
-  }, 15000);
+  }, 20000);
 
-  function cleanup() {
+  function onMessage(evt) {
+    // Accept messages from googleusercontent or script.google.com domains
+    if (!evt.data || typeof evt.data !== 'string') return;
+    let response;
+    try { response = JSON.parse(evt.data); } catch(e) { return; }
+    if (response.app !== 'spendwise') return;
     clearTimeout(timeout);
-    delete window[cbName];
-    const old = document.getElementById('jsonp-sync-script');
-    if (old) old.remove();
-  }
-
-  window[cbName] = function(response) {
-    cleanup();
+    window.removeEventListener('message', onMessage);
     btn.classList.remove('syncing'); btn.textContent = '⟳ Sync';
-    if (response && response.status === 'ok') {
+    if (response.status === 'ok') {
       state.lastSync = new Date().toISOString();
       save();
       showToast('Synced to Google Sheets ✓', 'success');
     } else {
-      showToast('Sync error: ' + (response && response.message || 'unknown'), 'error');
+      showToast('Sync error: ' + (response.message || 'unknown'), 'error');
     }
-  };
+  }
+  window.addEventListener('message', onMessage);
 
-  const encoded = btoa(unescape(encodeURIComponent(JSON.stringify(state))));
-  const url = state.scriptUrl
-    + '?action=sync'
-    + '&callback=' + cbName
-    + '&data=' + encodeURIComponent(encoded);
+  // Build a hidden form that POSTs to Apps Script inside an iframe
+  const iframe = document.createElement('iframe');
+  iframe.id = 'sync-iframe';
+  iframe.name = 'sync-iframe';
+  iframe.style.cssText = 'display:none;width:0;height:0;border:none;position:absolute;';
+  document.body.appendChild(iframe);
 
-  const script = document.createElement('script');
-  script.id = 'jsonp-sync-script';
-  script.src = url;
-  script.onerror = function() {
-    cleanup();
-    btn.classList.remove('syncing'); btn.textContent = '⟳ Sync';
-    showToast('Sync failed — check Script URL', 'error');
-  };
-  document.head.appendChild(script);
+  const form = document.createElement('form');
+  form.method = 'POST';
+  form.action = state.scriptUrl;
+  form.target = 'sync-iframe';
+  form.style.display = 'none';
+
+  const payload = JSON.stringify({
+    action: 'sync',
+    origin: window.location.origin,
+    data: state
+  });
+
+  const input = document.createElement('input');
+  input.type = 'hidden';
+  input.name = 'payload';
+  input.value = payload;
+  form.appendChild(input);
+  document.body.appendChild(form);
+  form.submit();
+  form.remove();
 }
 
 // ===== UTILS =====
