@@ -618,6 +618,8 @@
           <input type="url" id="settings-url" placeholder="https://sheetdb.io/api/v1/xxxxxxxx" />
         </div>
         <button class="btn btn-secondary" style="margin-bottom:0" onclick="saveScriptUrl()">Save URL</button>
+        <button class="btn btn-secondary" style="margin-top:10px" onclick="testSync()">🔍 Test Connection</button>
+        <div id="test-result" style="margin-top:12px;font-size:0.75rem;font-family:'DM Mono',monospace;color:var(--muted);word-break:break-all;display:none"></div>
       </div>
 
       <div class="card">
@@ -1052,6 +1054,55 @@ function renderTransferHistory() {
 }
 
 // ===== BALANCE TAB =====
+async function testSync() {
+  const resultEl = document.getElementById('test-result');
+  resultEl.style.display = 'block';
+  resultEl.style.color = 'var(--muted)';
+  resultEl.textContent = 'Testing…';
+
+  if (!state.scriptUrl) {
+    resultEl.textContent = '❌ No URL saved yet';
+    resultEl.style.color = 'var(--danger)';
+    return;
+  }
+
+  try {
+    // Step 1: GET the SheetDB endpoint to check it's reachable
+    resultEl.textContent = 'Step 1: Checking SheetDB endpoint…';
+    const getRes = await fetch(state.scriptUrl, { method: 'GET' });
+    const getJson = await getRes.json();
+    resultEl.textContent = 'Step 1 OK: ' + JSON.stringify(getJson).substring(0, 100);
+
+    // Step 2: Try a POST insert
+    resultEl.textContent += '\nStep 2: Testing POST…';
+    const testRecord = {
+      id: 'spendwise_state',
+      balances: '{}',
+      expenses: '[]',
+      transfers: '[]',
+      lastSync: new Date().toISOString()
+    };
+    const postRes = await fetch(state.scriptUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: [testRecord] })
+    });
+    const postText = await postRes.text();
+    resultEl.textContent += '\nStep 2 (' + postRes.status + '): ' + postText.substring(0, 150);
+
+    if (postRes.ok) {
+      resultEl.style.color = 'var(--success)';
+      resultEl.textContent += '\n\n✅ SheetDB is working!';
+    } else {
+      resultEl.style.color = 'var(--danger)';
+      resultEl.textContent += '\n\n❌ POST failed — see error above';
+    }
+  } catch (err) {
+    resultEl.style.color = 'var(--danger)';
+    resultEl.textContent = '❌ Error: ' + err.message;
+  }
+}
+
 function saveScriptUrl() {
   const url = document.getElementById('settings-url').value.trim();
   if (!url) { showToast('Enter a URL', 'error'); return; }
@@ -1324,6 +1375,8 @@ async function syncNow() {
 
     state.lastSync = new Date().toISOString();
     save();
+    renderAll();          // re-render so merged remote data appears immediately
+    setupMonthFilter();
     btn.classList.remove('syncing'); btn.textContent = '⟳ Sync';
     showToast('Synced ✓', 'success');
   } catch (err) {
@@ -1336,39 +1389,89 @@ async function syncNow() {
 async function syncSheetDB() {
   const base = state.scriptUrl.replace(/\/$/, '');
 
+  // ── STEP 1: Pull remote state ──
+  let remote = null;
+  try {
+    const getRes = await fetch(base + '?limit=1&search[id]=spendwise_state');
+    if (getRes.ok) {
+      const rows = await getRes.json();
+      if (rows && rows.length > 0) {
+        remote = {
+          balances:  safeParseJSON(rows[0].balances,  { debit:0, credit:0, cash:0 }),
+          expenses:  safeParseJSON(rows[0].expenses,  []),
+          transfers: safeParseJSON(rows[0].transfers, []),
+          lastSync:  rows[0].lastSync || null
+        };
+      }
+    }
+  } catch(e) {
+    console.warn('Could not pull remote state, will push local only:', e);
+  }
+
+  // ── STEP 2: Merge remote + local ──
+  if (remote) {
+    // Merge expenses: union by id, local version wins on conflict
+    const localIds  = new Set(state.expenses.map(e => String(e.id)));
+    const remoteNew = remote.expenses.filter(e => !localIds.has(String(e.id)));
+    state.expenses  = [...state.expenses, ...remoteNew];
+
+    // Merge transfers: union by id
+    const localTIds  = new Set(state.transfers.map(t => String(t.id)));
+    const remoteTNew = remote.transfers.filter(t => !localTIds.has(String(t.id)));
+    state.transfers  = [...state.transfers, ...remoteTNew];
+
+    // Balances: take the remote balances as base, then replay any
+    // local-only expenses/transfers on top so nothing double-counts.
+    // Simpler & safer: keep local balances (user manages these manually).
+    // Remote balance only wins if local has never been set (all zeros).
+    const localEmpty = state.balances.debit === 0 &&
+                       state.balances.credit === 0 &&
+                       state.balances.cash === 0;
+    if (localEmpty) {
+      state.balances = remote.balances;
+    }
+
+    // Save merged state locally first
+    save();
+  }
+
+  // ── STEP 3: Push merged state to Sheets ──
   const record = {
-    id: 'spendwise_state',
-    balances: JSON.stringify(state.balances),
-    expenses: JSON.stringify(state.expenses),
+    id:        'spendwise_state',
+    balances:  JSON.stringify(state.balances),
+    expenses:  JSON.stringify(state.expenses),
     transfers: JSON.stringify(state.transfers),
-    lastSync: new Date().toISOString()
+    lastSync:  new Date().toISOString()
   };
 
-  // Try to update existing row first
-  const updateRes = await fetch(base + '/id/spendwise_state', {
+  // Try PUT (update) first, fall back to POST (insert)
+  const putRes = await fetch(base + '/id/spendwise_state', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ data: record })
   });
 
-  // If row doesn't exist yet (404), insert it
-  if (updateRes.status === 404 || updateRes.status === 400) {
-    const insertRes = await fetch(base, {
+  if (putRes.status === 404 || putRes.status === 400) {
+    const postRes = await fetch(base, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ data: [record] })
     });
-    if (!insertRes.ok) {
-      const txt = await insertRes.text();
-      throw new Error('SheetDB error ' + insertRes.status + ': ' + txt);
+    if (!postRes.ok) {
+      const txt = await postRes.text();
+      throw new Error('SheetDB error ' + postRes.status + ': ' + txt);
     }
     return;
   }
 
-  if (!updateRes.ok) {
-    const txt = await updateRes.text();
-    throw new Error('SheetDB error ' + updateRes.status + ': ' + txt);
+  if (!putRes.ok) {
+    const txt = await putRes.text();
+    throw new Error('SheetDB error ' + putRes.status + ': ' + txt);
   }
+}
+
+function safeParseJSON(str, fallback) {
+  try { return JSON.parse(str); } catch(e) { return fallback; }
 }
 
 async function syncAppsScript() {
