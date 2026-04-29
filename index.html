@@ -321,17 +321,17 @@
   <div class="setup-card">
     <div class="setup-step active" id="step-welcome">
       <h3>Connect Google Sheets?</h3>
-      <p class="apps-script-steps">Store your data permanently in a Google Sheet so it syncs across devices and sessions.<br><br>
-        <b>Quick setup (5 min):</b><br>
-        1. Open <b>Google Sheets</b> → new spreadsheet<br>
-        2. Go to <b>Extensions → Apps Script</b><br>
-        3. Paste the script from the next step<br>
-        4. Click <b>Deploy → Web App</b> (access: Anyone)<br>
-        5. Copy the Web App URL here
+      <p class="apps-script-steps">Sync your data to Google Sheets so it persists across devices.<br><br>
+        <b>Easiest setup via SheetDB (2 min, free):</b><br>
+        1. Create a new <b>Google Sheet</b><br>
+        2. Go to <b>sheetdb.io</b> → sign in with Google<br>
+        3. Click <b>Create new API</b> → select your sheet<br>
+        4. Copy the API URL (looks like <code>https://sheetdb.io/api/v1/xxxxxxxx</code>)<br>
+        5. Paste it below
       </p>
       <div class="form-group">
-        <label>Apps Script Web App URL</label>
-        <input type="url" id="setup-url" placeholder="https://script.google.com/macros/s/..." />
+        <label>SheetDB API URL</label>
+        <input type="url" id="setup-url" placeholder="https://sheetdb.io/api/v1/xxxxxxxx" />
       </div>
       <button class="btn btn-primary" onclick="saveSetup()">Connect & Continue</button>
       <button class="skip-btn" onclick="skipSetup()">Skip — use local storage only</button>
@@ -609,6 +609,15 @@
             <div class="amount" id="bal-cash">$0.00</div>
           </div>
         </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Sync Settings</div>
+        <div class="form-group">
+          <label>SheetDB API URL</label>
+          <input type="url" id="settings-url" placeholder="https://sheetdb.io/api/v1/xxxxxxxx" />
+        </div>
+        <button class="btn btn-secondary" style="margin-bottom:0" onclick="saveScriptUrl()">Save URL</button>
       </div>
 
       <div class="card">
@@ -1043,6 +1052,16 @@ function renderTransferHistory() {
 }
 
 // ===== BALANCE TAB =====
+function saveScriptUrl() {
+  const url = document.getElementById('settings-url').value.trim();
+  if (!url) { showToast('Enter a URL', 'error'); return; }
+  state.scriptUrl = url;
+  localStorage.setItem('spendwise_url', url);
+  save();
+  document.getElementById('settings-url').value = '';
+  showToast('Sync URL saved', 'success');
+}
+
 function updateBalance() {
   const account = document.getElementById('bal-account').value;
   const val = parseFloat(document.getElementById('bal-new').value);
@@ -1054,6 +1073,8 @@ function updateBalance() {
 }
 
 function renderBalanceTab() {
+  const urlField = document.getElementById('settings-url');
+  if (urlField && state.scriptUrl) urlField.placeholder = state.scriptUrl.substring(0, 40) + '…';
   document.getElementById('bal-debit').textContent = '$' + (state.balances.debit || 0).toFixed(2);
   document.getElementById('bal-credit').textContent = '$' + (state.balances.credit || 0).toFixed(2);
   document.getElementById('bal-cash').textContent = '$' + (state.balances.cash || 0).toFixed(2);
@@ -1283,34 +1304,75 @@ function renderChart(id, type, labels, datasets) {
 }
 
 // ===== SYNC =====
-// Approach: no-cors fetch POST (fire-and-forget).
-// Apps Script writes to Sheets; we can't read the response due to CORS opaque response,
-// but the write always succeeds if the script URL and deployment are correct.
-// We verify by doing a lightweight GET ping via <script> JSONP after a short delay.
-function syncNow() {
-  if (!state.scriptUrl) { showToast('No sync URL configured', 'error'); return; }
+// Uses SheetDB (sheetdb.io) — a free service that exposes Google Sheets as a REST API.
+// Supports real CORS, works on all devices including mobile Chrome.
+// Fallback: if no URL set, saves locally only.
+
+async function syncNow() {
+  if (!state.scriptUrl) { showToast('No sync URL — saved locally', 'error'); return; }
   const btn = document.getElementById('sync-btn');
   btn.classList.add('syncing'); btn.textContent = '⟳ Syncing…';
 
-  const payload = JSON.stringify({ action: 'sync', data: state });
+  try {
+    const isSheetDB = state.scriptUrl.includes('sheetdb.io');
 
-  fetch(state.scriptUrl, {
-    method: 'POST',
-    mode: 'no-cors',          // opaque response — CORS headers not needed
-    headers: { 'Content-Type': 'text/plain' }, // text/plain avoids preflight
-    body: payload
-  })
-  .then(() => {
-    // Fetch resolved (even opaque = request was sent successfully)
+    if (isSheetDB) {
+      await syncSheetDB();
+    } else {
+      await syncAppsScript();
+    }
+
     state.lastSync = new Date().toISOString();
     save();
     btn.classList.remove('syncing'); btn.textContent = '⟳ Sync';
-    showToast('Synced to Google Sheets ✓', 'success');
-  })
-  .catch(err => {
+    showToast('Synced ✓', 'success');
+  } catch (err) {
     btn.classList.remove('syncing'); btn.textContent = '⟳ Sync';
-    showToast('Sync failed — check connection', 'error');
+    showToast('Sync failed: ' + err.message, 'error');
     console.error('Sync error:', err);
+  }
+}
+
+async function syncSheetDB() {
+  const base = state.scriptUrl.replace(/\/$/, '');
+
+  // SheetDB uses one sheet per "table". We'll use a single sheet named "data"
+  // and store everything as a single serialised row that we replace each time.
+  // First DELETE existing rows, then CREATE fresh.
+  const record = [{
+    id: 'spendwise_state',
+    balances: JSON.stringify(state.balances),
+    expenses: JSON.stringify(state.expenses),
+    transfers: JSON.stringify(state.transfers),
+    lastSync: new Date().toISOString()
+  }];
+
+  // Delete all existing rows first
+  await fetch(base + '/all', {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' }
+  });
+
+  // Insert fresh data
+  const res = await fetch(base, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ data: record })
+  });
+
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error('SheetDB error ' + res.status + ': ' + txt);
+  }
+}
+
+async function syncAppsScript() {
+  // Legacy no-cors fire-and-forget for Apps Script URLs
+  await fetch(state.scriptUrl, {
+    method: 'POST',
+    mode: 'no-cors',
+    headers: { 'Content-Type': 'text/plain' },
+    body: JSON.stringify({ action: 'sync', data: state })
   });
 }
 // ===== UTILS =====
