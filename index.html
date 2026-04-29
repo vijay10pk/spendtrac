@@ -1336,33 +1336,38 @@ async function syncNow() {
 async function syncSheetDB() {
   const base = state.scriptUrl.replace(/\/$/, '');
 
-  // SheetDB uses one sheet per "table". We'll use a single sheet named "data"
-  // and store everything as a single serialised row that we replace each time.
-  // First DELETE existing rows, then CREATE fresh.
-  const record = [{
+  const record = {
     id: 'spendwise_state',
     balances: JSON.stringify(state.balances),
     expenses: JSON.stringify(state.expenses),
     transfers: JSON.stringify(state.transfers),
     lastSync: new Date().toISOString()
-  }];
+  };
 
-  // Delete all existing rows first
-  await fetch(base + '/all', {
-    method: 'DELETE',
-    headers: { 'Content-Type': 'application/json' }
-  });
-
-  // Insert fresh data
-  const res = await fetch(base, {
-    method: 'POST',
+  // Try to update existing row first
+  const updateRes = await fetch(base + '/id/spendwise_state', {
+    method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ data: record })
   });
 
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error('SheetDB error ' + res.status + ': ' + txt);
+  // If row doesn't exist yet (404), insert it
+  if (updateRes.status === 404 || updateRes.status === 400) {
+    const insertRes = await fetch(base, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: [record] })
+    });
+    if (!insertRes.ok) {
+      const txt = await insertRes.text();
+      throw new Error('SheetDB error ' + insertRes.status + ': ' + txt);
+    }
+    return;
+  }
+
+  if (!updateRes.ok) {
+    const txt = await updateRes.text();
+    throw new Error('SheetDB error ' + updateRes.status + ': ' + txt);
   }
 }
 
